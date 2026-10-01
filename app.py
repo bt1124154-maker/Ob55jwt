@@ -1,15 +1,12 @@
 import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import re
 import json
 import time
 import base64
 import logging
-import asyncio
-import urllib.parse
-from datetime import datetime, timezone
 
-import aiohttp
-import requests
 import httpx
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -22,35 +19,24 @@ from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 from google.protobuf import json_format
-from google.protobuf.message import Message
 
-# ============================================================
-#  LOGGING
-# ============================================================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ff_api")
 
 # ============================================================
 #  SETTINGS
 # ============================================================
-AES_KEY = base64.b64decode("WWcmdGMlREV1aDYlWmNeOA==")  # Yg&tc%h6%Zc^8
-AES_IV = base64.b64decode("Nm95WkRyMjJFM3ljaGpNJQ==")   # 6oyZDr22chjM%
+AES_KEY = base64.b64decode("WWcmdGMlREV1aDYlWmNeOA==")
+AES_IV  = base64.b64decode("Nm95WkRyMjJFM3ljaGpNJQ==")
 USERAGENT = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
 RELEASEVERSION = "OB55"
-REQUEST_DELAY = 0.3
 
-LOGIN_URL = "https://loginbp.ggpolarbear.com/"
-LOGIN_URL_ALT = "https://loginbp.ppmainecoonghj.com/"
+LOGIN_URL = "https://loginbp.ggpolarbear.com/MajorLogin"
+LOGIN_URL_ALT = "https://loginbp.ppmainecoonghj.com/MajorLogin"
 OAUTH_URL = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
 
-# Fast HTTP client (sync fallback)
-HTTP_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=50)
-HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
-_http_client = httpx.Client(limits=HTTP_LIMITS, timeout=HTTP_TIMEOUT)
+HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+_http_client = httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True)
 
 # ============================================================
 #  PROTOBUF — FreeFire_pb2 (inlined)
@@ -90,14 +76,8 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "FreeFire_pb2", _g)
 
 if not _descriptor._USE_C_DESCRIPTORS:
     DESCRIPTOR._loaded_options = None
-    _g["_BANREASON"]._serialized_start = 738
-    _g["_BANREASON"]._serialized_end = 906
     _g["_LOGINREQ"]._serialized_start = 18
     _g["_LOGINREQ"]._serialized_end = 117
-    _g["_BLACKLISTINFORES"]._serialized_start = 119
-    _g["_BLACKLISTINFORES"]._serialized_end = 212
-    _g["_LOGINQUEUEINFO"]._serialized_start = 214
-    _g["_LOGINQUEUEINFO"]._serialized_end = 316
     _g["_LOGINRES"]._serialized_start = 319
     _g["_LOGINRES"]._serialized_end = 735
 
@@ -106,105 +86,71 @@ LoginRes = _g["LoginRes"]
 
 
 # ============================================================
-#  HELPERS — AES / Proto / Parsing
+#  HELPERS
 # ============================================================
-def pad_bytes(text: bytes) -> bytes:
-    padding_length = AES.block_size - (len(text) % AES.block_size)
-    return text + bytes([padding_length] * padding_length)
-
-
-def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+def aes_encrypt(key, iv, plaintext: bytes) -> bytes:
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
 
 
-def json_to_proto(json_data: str, proto_message: Message) -> bytes:
-    json_format.ParseDict(json.loads(json_data), proto_message)
-    return proto_message.SerializeToString()
-
-
-def try_parse_login_res(data: bytes):
+def extract_login_res(raw: bytes):
+    """Try multiple methods to extract LoginRes from response"""
+    # Method 1: Parse from start
     try:
         msg = LoginRes()
-        msg.ParseFromString(data)
+        msg.ParseFromString(raw)
         if msg.account_id and msg.account_id > 0:
             return json.loads(json_format.MessageToJson(msg))
     except Exception:
         pass
-    return None
 
-
-def extract_login_res(raw: bytes) -> dict:
-    # Attempt 1: from index 0
-    parsed = try_parse_login_res(raw)
-    if parsed:
-        return parsed
-
-    # Attempt 2: scan each \x08
+    # Method 2: Scan for \x08 marker
     idx = 0
     while True:
         idx = raw.find(b"\x08", idx)
         if idx == -1:
             break
-        parsed = try_parse_login_res(raw[idx:])
-        if parsed:
-            return parsed
+        try:
+            msg = LoginRes()
+            msg.ParseFromString(raw[idx:])
+            if msg.account_id and msg.account_id > 0:
+                return json.loads(json_format.MessageToJson(msg))
+        except Exception:
+            pass
         idx += 1
 
-    # Attempt 3: JWT marker prefix
+    # Method 3: Find JWT marker and go back to 0x42
     jwt_marker = raw.find(b"eyJhbGciOiJIUzI1NiIs")
     if jwt_marker != -1:
         for i in range(jwt_marker - 1, max(jwt_marker - 300, -1), -1):
             if raw[i] == 0x42:
-                parsed = try_parse_login_res(raw[i:])
-                if parsed:
-                    return parsed
+                try:
+                    msg = LoginRes()
+                    msg.ParseFromString(raw[i:])
+                    if msg.account_id and msg.account_id > 0:
+                        return json.loads(json_format.MessageToJson(msg))
+                except Exception:
+                    pass
                 break
 
     return None
 
 
 def extract_jwt_from_bytes(content: bytes):
-    """Regex-based JWT extraction (from app.py)"""
-    match = re.search(rb'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', content)
+    """Extract JWT token using regex"""
+    match = re.search(
+        rb'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
+        content
+    )
     if match:
         try:
             return match.group(0).decode('utf-8')
         except Exception:
             pass
-
-    for i in range(len(content) - 5):
-        if content[i] == 0x42:
-            if content[i + 1] == 0x80 or (i + 2 < len(content) and content[i + 2:i + 5] == b'eyJ'):
-                length = content[i + 1]
-                if length & 0x80:
-                    length = (length & 0x7f) | (content[i + 2] << 7)
-                    token_start = i + 3
-                else:
-                    token_start = i + 2
-
-                if content[token_start:token_start + 3] == b'eyJ':
-                    token_bytes = content[token_start:token_start + length]
-                    try:
-                        return token_bytes.decode('utf-8')
-                    except Exception:
-                        pass
-
-    eyj_pos = content.find(b'eyJ')
-    if eyj_pos > 0:
-        tail = content[eyj_pos:eyj_pos + 2000]
-        m = re.match(rb'[A-Za-z0-9_\-\.]+', tail)
-        if m:
-            try:
-                token = m.group(0).decode('utf-8')
-                if token.count('.') >= 2:
-                    return token
-            except Exception:
-                pass
-
     return None
 
 
-def extract_region_from_bytes(content: bytes) -> str:
+def extract_region(content: bytes) -> str:
+    """Extract region from byte stream"""
     for i in range(len(content) - 6):
         if content[i] == 0x12:
             rlen = content[i + 1]
@@ -219,13 +165,15 @@ def extract_region_from_bytes(content: bytes) -> str:
 
 
 def decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without verification"""
     try:
         parts = token.split('.')
         if len(parts) >= 2:
             payload_b64 = parts[1]
             payload_b64 += '=' * ((4 - len(payload_b64) % 4) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8'))
-            return payload
+            return json.loads(
+                base64.urlsafe_b64decode(payload_b64).decode('utf-8')
+            )
     except Exception:
         pass
     return {}
@@ -234,269 +182,167 @@ def decode_jwt_payload(token: str) -> dict:
 # ============================================================
 #  OAUTH — Get Access Token
 # ============================================================
-async def get_tokens_async(session: aiohttp.ClientSession, uid: str, password: str):
-    await asyncio.sleep(REQUEST_DELAY)
-
+def get_access_token(uid: str, password: str):
+    """Get access_token and open_id from Garena OAuth"""
+    # Method 1: New JSON endpoint
     payload = {
         "client_id": 100067,
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f71e54715b7d1e3",
         "client_type": 2,
         "password": password,
         "response_type": "token",
-        "uid": int(uid)
+        "uid": int(uid) if uid.isdigit() else uid,
     }
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": USERAGENT
-    }
-
-    try:
-        async with session.post(OAUTH_URL, json=payload, headers=headers, timeout=30) as r:
-            if r.status == 200:
-                data = (await r.json()).get('data', {})
-                at = data.get('access_token')
-                oid = data.get('open_id')
-                if at and oid:
-                    logger.info(f"OAuth OK for UID: {uid}")
-                    return {"open_id": oid, "access_token": at}
-            return None
-    except Exception as e:
-        logger.error(f"OAuth exception {uid}: {e}")
-        return None
-
-
-def get_access_token_sync(account: str):
-    """Sync fallback — uses httpx"""
-    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
-    payload = (
-        account
-        + "&response_type=token&client_type=2"
-        + "&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
-        + "&client_id=100067"
-    )
-    headers = {
         "User-Agent": USERAGENT,
-        "Connection": "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "Content-Type": "application/x-www-form-urlencoded",
     }
     try:
-        resp = _http_client.post(url, data=payload, headers=headers)
-        data = resp.json()
-        return data.get("access_token", "0"), data.get("open_id", "0")
+        r = _http_client.post(OAUTH_URL, json=payload, headers=headers)
+        logger.info(f"OAuth (JSON) status: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            at = data.get("access_token")
+            oid = data.get("open_id")
+            if at and oid:
+                return at, oid
     except Exception as e:
-        logger.error(f"Sync OAuth error: {e}")
-        return "0", "0"
+        logger.error(f"OAuth JSON error: {e}")
+
+    # Method 2: Old form endpoint (fallback)
+    try:
+        url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+        body = (
+            f"uid={uid}&password={password}"
+            "&response_type=token&client_type=2"
+            "&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+            "&client_id=100067"
+        )
+        headers2 = {
+            "User-Agent": USERAGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        r = _http_client.post(url, data=body, headers=headers2)
+        logger.info(f"OAuth (form) status: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("access_token"), data.get("open_id")
+    except Exception as e:
+        logger.error(f"OAuth form error: {e}")
+
+    return None, None
 
 
 # ============================================================
 #  MAJOR LOGIN — Get JWT Token
 # ============================================================
-async def major_login_async(session: aiohttp.ClientSession, access_token: str, open_id: str):
-    await asyncio.sleep(REQUEST_DELAY / 2)
-    logger.info(f"MajorLogin for OpenID: {open_id}")
+def major_login(access_token: str, open_id: str):
+    """Send MajorLogin request and parse response"""
+    # Build LoginReq protobuf
+    req = LoginReq()
+    req.open_id = open_id
+    req.open_id_type = "4"
+    req.login_token = access_token
+    req.orign_platform_type = "4"
 
-    try:
-        req = LoginReq()
-        req.open_id = open_id
-        req.open_id_type = "4"
-        req.login_token = access_token
-        req.orign_platform_type = "4"
-
-        serialized = req.SerializeToString()
-        encrypted = aes_cbc_encrypt(AES_KEY, AES_IV, serialized)
-
-        url = f"{LOGIN_URL}MajorLogin"
-        headers = {
-            'User-Agent': USERAGENT,
-            'Accept': "*/*",
-            'Accept-Encoding': "deflate, gzip",
-            'X-GA-SV': "1789568421",
-            'Authorization': f"Bearer {access_token}",
-            'X-GA': "v1 1",
-            'ReleaseVersion': RELEASEVERSION,
-            'Content-Type': "application/x-www-form-urlencoded",
-            'X-Unity-Version': "2018.4.12f1",
-            'PlAy_VeR': "1.132.1",
-            'Ob_VeR': RELEASEVERSION,
-        }
-
-        async with session.post(url, data=encrypted, headers=headers, timeout=30) as r:
-            logger.info(f"MajorLogin HTTP: {r.status}")
-
-            if r.status != 200:
-                return None
-
-            content = await r.read()
-            logger.info(f"Response: {len(content)} bytes")
-
-            # Method 1: Proto parse
-            proto_msg = extract_login_res(content)
-            if proto_msg and proto_msg.get('token'):
-                return {
-                    "token": proto_msg.get('token', ''),
-                    "region": proto_msg.get('lockRegion', proto_msg.get('notiRegion', 'N/A')),
-                    "account_id": proto_msg.get('accountId'),
-                    "nickname": proto_msg.get('nickname', ''),
-                    "ttl": proto_msg.get('ttl', 86400),
-                    "server_url": proto_msg.get('serverUrl'),
-                }
-
-            # Method 2: JWT regex
-            token = extract_jwt_from_bytes(content)
-            if token and len(token) > 50:
-                region = extract_region_from_bytes(content)
-                payload = decode_jwt_payload(token)
-                return {
-                    "token": token,
-                    "region": region,
-                    "account_id": payload.get('account_id'),
-                    "nickname": payload.get('nickname', ''),
-                    "ttl": 86400,
-                    "server_url": None
-                }
-
-            # Method 3: Decrypt then parse
-            try:
-                dec = AES.new(AES_KEY, AES.MODE_CBC, AES_IV).decrypt(content)
-                proto_msg = extract_login_res(dec)
-                if proto_msg and proto_msg.get('token'):
-                    return {
-                        "token": proto_msg.get('token', ''),
-                        "region": proto_msg.get('lockRegion', proto_msg.get('notiRegion', 'N/A')),
-                        "account_id": proto_msg.get('accountId'),
-                        "nickname": proto_msg.get('nickname', ''),
-                        "ttl": proto_msg.get('ttl', 86400),
-                        "server_url": proto_msg.get('serverUrl'),
-                    }
-                token = extract_jwt_from_bytes(dec)
-                if token and len(token) > 50:
-                    region = extract_region_from_bytes(dec)
-                    payload = decode_jwt_payload(token)
-                    return {
-                        "token": token,
-                        "region": region,
-                        "account_id": payload.get('account_id'),
-                        "nickname": payload.get('nickname', ''),
-                        "ttl": 86400,
-                        "server_url": None
-                    }
-            except Exception:
-                pass
-
-            return None
-
-    except asyncio.TimeoutError:
-        return None
-    except Exception as e:
-        logger.error(f"MajorLogin exception: {e}", exc_info=True)
-        return None
-
-
-# ============================================================
-#  GENERATE JWT — Main async pipeline
-# ============================================================
-async def generate_jwt_async(uid: str, password: str) -> dict:
-    start = time.time()
-    result = {
-        "success": False,
-        "uid": uid,
-        "token": None,
-        "region": None,
-        "account_id": None,
-        "nickname": None,
-        "ttl": None,
-        "server_url": None,
-        "error": None,
-        "elapsed_ms": 0
-    }
-
-    try:
-        connector = aiohttp.TCPConnector(limit=10, ssl=False)
-        timeout = aiohttp.ClientTimeout(total=60)
-
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            tokens = await get_tokens_async(session, uid, password)
-            if not tokens:
-                result["error"] = "Failed to get access token"
-                result["elapsed_ms"] = int((time.time() - start) * 1000)
-                return result
-
-            login_data = await major_login_async(session, tokens["access_token"], tokens["open_id"])
-            if not login_data:
-                result["error"] = "MajorLogin failed"
-                result["elapsed_ms"] = int((time.time() - start) * 1000)
-                return result
-
-            result.update({
-                "success": True,
-                "token": login_data["token"],
-                "region": login_data["region"],
-                "account_id": login_data.get("account_id"),
-                "nickname": login_data.get("nickname"),
-                "ttl": login_data.get("ttl"),
-                "server_url": login_data.get("server_url"),
-                "access_token": tokens["access_token"],
-                "open_id": tokens["open_id"],
-            })
-
-    except Exception as e:
-        logger.error(f"generate_jwt error: {e}", exc_info=True)
-        result["error"] = str(e)
-
-    result["elapsed_ms"] = int((time.time() - start) * 1000)
-    return result
-
-
-def generate_jwt_sync(uid: str, password: str) -> dict:
-    """Sync wrapper using httpx (from file 1)"""
-    start_time = time.time()
-
-    token_val, open_id = get_access_token_sync(f"uid={uid}&password={password}")
-    if token_val == "0" or open_id == "0":
-        raise Exception("Invalid UID or Password — access token not received")
-
-    body = json.dumps({
-        "open_id": open_id,
-        "open_id_type": "4",
-        "login_token": token_val,
-        "orign_platform_type": "4",
-    })
-    proto_bytes = json_to_proto(body, LoginReq())
-    payload = aes_cbc_encrypt(AES_KEY, AES_IV, proto_bytes)
+    serialized = req.SerializeToString()
+    encrypted = aes_encrypt(AES_KEY, AES_IV, serialized)
 
     headers = {
         "User-Agent": USERAGENT,
         "Accept": "*/*",
         "Accept-Encoding": "deflate, gzip",
-        "X-Ga-Sv": "1789534056",
-        "Authorization": "Bearer",
-        "X-Ga": "v1 1",
-        "Releaseversion": RELEASEVERSION,
+        "X-GA-SV": "1789568421",
+        "Authorization": f"Bearer {access_token}",
+        "X-GA": "v1 1",
+        "ReleaseVersion": RELEASEVERSION,
         "Content-Type": "application/x-www-form-urlencoded",
         "X-Unity-Version": "2018.4.12f1",
         "PlAy_VeR": "1.132.1",
         "Ob_VeR": RELEASEVERSION,
     }
 
-    resp = _http_client.post(f"{LOGIN_URL_ALT}MajorLogin", data=payload, headers=headers)
-    msg = extract_login_res(resp.content)
-    if not msg:
-        raise Exception("Could not parse LoginRes")
+    for url in (LOGIN_URL, LOGIN_URL_ALT):
+        try:
+            logger.info(f"MajorLogin trying: {url}")
+            r = _http_client.post(url, data=encrypted, headers=headers)
+            logger.info(f"MajorLogin status: {r.status_code}, size: {len(r.content)}")
 
-    elapsed = time.time() - start_time
+            if r.status_code != 200:
+                continue
 
-    return {
-        "access_token": token_val,
-        "open_id": open_id,
-        "real_uid": str(msg.get("accountId", "")),
-        "status": "success",
-        "time": f"{elapsed:.2f}s",
-        "token": f"{msg.get('token', '')}",
-        "region": msg.get('lockRegion', msg.get('notiRegion', 'N/A')),
-        "account_id": msg.get("accountId"),
-        "nickname": msg.get("nickname", ""),
-    }
+            content = r.content
+
+            # Try 1: Proto parse
+            msg = extract_login_res(content)
+            if msg and msg.get("token"):
+                logger.info("Token extracted via proto parse")
+                return {
+                    "token": msg.get("token", ""),
+                    "region": (
+                        msg.get("lockRegion")
+                        or msg.get("notiRegion")
+                        or msg.get("ipRegion")
+                        or "N/A"
+                    ),
+                    "account_id": msg.get("accountId"),
+                    "nickname": msg.get("nickname", ""),
+                    "ttl": msg.get("ttl", 86400),
+                    "server_url": msg.get("serverUrl"),
+                }
+
+            # Try 2: JWT regex extraction
+            token = extract_jwt_from_bytes(content)
+            if token and len(token) > 50:
+                logger.info("Token extracted via JWT regex")
+                payload = decode_jwt_payload(token)
+                return {
+                    "token": token,
+                    "region": extract_region(content),
+                    "account_id": payload.get("account_id"),
+                    "nickname": payload.get("nickname", ""),
+                    "ttl": 86400,
+                    "server_url": None,
+                }
+
+            # Try 3: Decrypt then parse
+            try:
+                decrypted = AES.new(
+                    AES_KEY, AES.MODE_CBC, AES_IV
+                ).decrypt(content)
+
+                msg = extract_login_res(decrypted)
+                if msg and msg.get("token"):
+                    logger.info("Token extracted via decrypt+proto")
+                    return {
+                        "token": msg.get("token", ""),
+                        "region": msg.get("lockRegion") or "N/A",
+                        "account_id": msg.get("accountId"),
+                        "nickname": msg.get("nickname", ""),
+                        "ttl": msg.get("ttl", 86400),
+                        "server_url": msg.get("serverUrl"),
+                    }
+
+                token = extract_jwt_from_bytes(decrypted)
+                if token and len(token) > 50:
+                    logger.info("Token extracted via decrypt+regex")
+                    payload = decode_jwt_payload(token)
+                    return {
+                        "token": token,
+                        "region": extract_region(decrypted),
+                        "account_id": payload.get("account_id"),
+                        "nickname": payload.get("nickname", ""),
+                        "ttl": 86400,
+                        "server_url": None,
+                    }
+            except Exception as e:
+                logger.error(f"Decrypt attempt failed: {e}")
+
+        except Exception as e:
+            logger.error(f"MajorLogin error on {url}: {e}")
+            continue
+
+    return None
 
 
 # ============================================================
@@ -512,79 +358,72 @@ def index():
         "name": "FreeFire Token API",
         "status": "online",
         "endpoints": {
-            "/token": "GET /token?uid=UID&password=PASS (sync)",
-            "/generate": "GET /generate?uid=UID&password=PASS (async)",
+            "/token": "GET /token?uid=UID&password=PASS",
+            "/generate": "GET /generate?uid=UID&password=PASS",
         },
         "example": "/token?uid=18097039025&password=yourpass"
     }), 200
 
 
 @app.route("/token", methods=["GET"])
-def api_token():
-    """Sync endpoint (from file 1)"""
-    uid = request.args.get("uid")
-    password = request.args.get("password")
-
-    if not uid or not password:
-        return jsonify({
-            "status": "error",
-            "error": "Both uid and password parameters are required"
-        }), 400
-
-    try:
-        token_data = generate_jwt_sync(uid, password)
-        return jsonify(token_data), 200
-    except Exception as e:
-        logger.error(f"Token error: {e}", exc_info=True)
-        return jsonify({
-            "status": "error",
-            "error": f"Failed to generate token: {str(e)}"
-        }), 500
-
-
 @app.route("/generate", methods=["GET"])
-def api_generate():
-    """Async endpoint (from file 2)"""
+def api_token():
     uid = request.args.get("uid", "").strip()
     password = request.args.get("password", "").strip()
 
     if not uid or not password:
         return jsonify({
             "success": False,
-            "error": "Missing 'uid' or 'password' query parameter"
+            "error": "Both 'uid' and 'password' are required"
         }), 400
 
+    start = time.time()
     logger.info(f"Request: uid={uid}")
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(generate_jwt_async(uid, password))
-        loop.close()
+        # Step 1: OAuth
+        access_token, open_id = get_access_token(uid, password)
+        if not access_token or not open_id:
+            return jsonify({
+                "success": False,
+                "error": "Failed to get access token (check uid/password)"
+            }), 401
 
-        if not result["success"]:
-            return jsonify(result), 500
+        # Step 2: MajorLogin
+        login_data = major_login(access_token, open_id)
+        if not login_data:
+            return jsonify({
+                "success": False,
+                "error": "MajorLogin failed (server rejected or parse error)"
+            }), 500
 
-        return jsonify(result), 200
+        elapsed = int((time.time() - start) * 1000)
+
+        return jsonify({
+            "success": True,
+            "uid": uid,
+            "token": login_data["token"],
+            "region": login_data["region"],
+            "account_id": login_data.get("account_id"),
+            "nickname": login_data.get("nickname"),
+            "ttl": login_data.get("ttl"),
+            "server_url": login_data.get("server_url"),
+            "access_token": access_token,
+            "open_id": open_id,
+            "elapsed_ms": elapsed,
+        }), 200
 
     except Exception as e:
         logger.error(f"API error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # ============================================================
 #  ENTRY POINT
 # ============================================================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5002))
-    host = os.getenv("HOST", "0.0.0.0")
-
-    logger.info("=" * 60)
-    logger.info("FreeFire Token API (Merged)")
-    logger.info("=" * 60)
-    logger.info(f"Running:  http://{host}:{port}")
-    logger.info(f"Sync:     http://127.0.0.1:{port}/token?uid=XXX&password=YYY")
-    logger.info(f"Async:    http://127.0.0.1:{port}/generate?uid=XXX&password=YYY")
-    logger.info("=" * 60)
-
-    app.run(host=host, port=port, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
